@@ -1,524 +1,1882 @@
 package main
 
 import (
-	"bufio"
+	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
+	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
-	"log"
 )
 
-// 定义遥控器按键与功能的映射
-var commandMap = map[string]func(){
-	"KEY_UP":     func() { fmt.Println("上键被按下") },
-	"KEY_DOWN":   func() { fmt.Println("下键被按下") },
-	"KEY_LEFT":   func() { fmt.Println("左键被按下") },
-	"KEY_RIGHT":  func() { fmt.Println("右键被按下") },
-	"KEY_OK":     func() { fmt.Println("确定键被按下") },
-	"KEY_MENU":   func() { fmt.Println("菜单键被按下") },
-	"KEY_BACK":   func() { fmt.Println("返回键被按下") },
-	"KEY_POWER":  func() { fmt.Println("电源键被按下") },
-	"KEY_VOLUME_UP": func() { changeVolume("+5%") },
-	"KEY_VOLUME_DOWN": func() { changeVolume("-5%") },
+type VideoItem struct {
+	Name     string      `json:"name"`
+	Path     string      `json:"path"`
+	IsDir    bool        `json:"isDir"`
+	Children []VideoItem `json:"children,omitempty"`
 }
 
-// 修改系统音量
-func changeVolume(change string) {
-	cmd := exec.Command("amixer", "set", "Master", change)
-	err := cmd.Run()
+func getVideoList(directory string, relativePath string) []VideoItem {
+	var videos []VideoItem
+	files, err := ioutil.ReadDir(directory)
 	if err != nil {
-		fmt.Println("调整音量失败:", err)
-	} else {
-		fmt.Println("音量已调整:", change)
+		log.Printf("Error reading directory: %v", err)
+		return videos
 	}
-}
 
-// 连接LIRC守护进程以接收遥控器信号
-func connectToLIRC() (net.Conn, error) {
-	// 检查LIRC socket文件是否存在
-	socketPaths := []string{
-		"/var/run/lirc/lircd", 
-		"/run/lirc/lircd",
-		"/dev/lircd",
-		"/var/run/lirc/lircd.socket",
-	}
-	
-	var conn net.Conn
-	var err error
-	
-	for _, path := range socketPaths {
-		fmt.Printf("尝试连接LIRC socket: %s\n", path)
-		if _, statErr := os.Stat(path); statErr == nil {
-			conn, err = net.Dial("unix", path)
-			if err == nil {
-				fmt.Printf("成功连接到LIRC socket: %s\n", path)
-				return conn, nil
+	for _, file := range files {
+		currentPath := filepath.Join(directory, file.Name())
+		relativeName := filepath.Join(relativePath, file.Name())
+
+		if file.IsDir() {
+			children := getVideoList(currentPath, relativeName)
+			if len(children) > 0 {
+				videos = append(videos, VideoItem{
+					Name:     file.Name(),
+					Path:     relativeName,
+					IsDir:    true,
+					Children: children,
+				})
 			}
-			fmt.Printf("连接到 %s 失败: %v\n", path, err)
 		} else {
-			fmt.Printf("Socket路径不存在: %s\n", path)
-		}
-	}
-	
-	return nil, fmt.Errorf("无法连接到任何LIRC socket: %v", err)
-}
-
-// 添加直接处理IR信号的函数
-func processDirectIRSignals() {
-	fmt.Println("开始直接处理IR信号...")
-
-	// 创建一个通道用于定期检查IR信号
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			cmd := exec.Command("ir-keytable", "-t")
-			out, err := cmd.CombinedOutput()
-			if err == nil && len(out) > 0 {
-				fmt.Printf("检测到键盘事件: %s\n", string(out))
-				
-				// 尝试从输出中提取按键信息
-				lines := strings.Split(string(out), "\n")
-				for _, line := range lines {
-					if strings.Contains(line, "KEY_") {
-						parts := strings.Fields(line)
-						for _, part := range parts {
-							if strings.HasPrefix(part, "KEY_") {
-								fmt.Printf("检测到按键: %s\n", part)
-								if handler, ok := commandMap[part]; ok {
-									handler()
-								} else {
-									fmt.Printf("未映射的按键: %s\n", part)
-								}
-							}
-						}
-					}
-				}
+			ext := strings.ToLower(filepath.Ext(file.Name()))
+			if ext == ".mp4" || ext == ".webm" || ext == ".mkv" {
+				videos = append(videos, VideoItem{
+					Name:  file.Name(),
+					Path:  "/video/" + relativeName,
+					IsDir: false,
+				})
 			}
 		}
 	}
+	return videos
 }
 
-// 处理遥控器信号 - 使用更可靠的方式
-func processRemoteSignals(conn net.Conn) {
-	fmt.Println("开始处理遥控器信号...")
+// HLSConfig 配置HLS流参数
+type HLSConfig struct {
+	SegmentDuration  int    // 段时长(秒)
+	PlaylistSize     int    // 播放列表大小(段数量)
+	OutputDir        string // 输出目录
+	FFmpegBin        string // FFmpeg可执行文件路径
+	EnableTranscoding bool   // 是否启用转码
+	VideoCodec       string // 视频编码
+	AudioCodec       string // 音频编码
+}
+
+// HLSManager 管理HLS转换和分发
+type HLSManager struct {
+	config       HLSConfig
+	cmd          *exec.Cmd
+	mutex        sync.Mutex
+	isRunning    bool
+	lastError    error
+	streamActive bool
+}
+
+// NewHLSManager 创建新的HLS管理器
+func NewHLSManager(config HLSConfig) *HLSManager {
+	// 确保输出目录存在
+	os.MkdirAll(config.OutputDir, 0755)
 	
-	// 启动直接IR信号处理
-	go processDirectIRSignals()
-	
-	// 定期运行mode2捕捉原始IR信号
-	go func() {
-		for {
-			cmd := exec.Command("timeout", "3", "mode2", "-d", "/dev/lirc0")
-			var outBuf strings.Builder
-			cmd.Stdout = &outBuf
-			
-			err := cmd.Start()
-			if err == nil {
-				go func() {
-					time.Sleep(1 * time.Second)
-					fmt.Println("请按下遥控器按钮...")
-				}()
-				
-				err = cmd.Wait()
-				output := outBuf.String()
-				
-				if len(output) > 0 && strings.Contains(output, "pulse") {
-					fmt.Println("检测到IR脉冲，按钮被按下!")
-					// 触发一个通用按钮按下事件
-					fmt.Println("触发通用按钮事件")
-				}
-			}
-			time.Sleep(5 * time.Second)
+	return &HLSManager{
+		config:      config,
+		isRunning:   false,
+		streamActive: false,
+	}
+}
+
+// StartTranscoding 开始将RTP流转为HLS
+func (h *HLSManager) StartTranscoding(rtpAddress string) error {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+
+	if h.isRunning {
+		return fmt.Errorf("转码已在运行")
+	}
+
+	// 检查FFmpeg是否存在
+	ffmpegPath := h.config.FFmpegBin
+	if ffmpegPath == "" {
+		ffmpegPath = "ffmpeg" // 使用系统路径查找
+	}
+
+	// 构建FFmpeg命令
+	args := []string{
+		"-y",                     // 覆盖输出文件
+		"-i", "rtp://" + rtpAddress, // RTP输入地址
+		"-fflags", "nobuffer",    // 减少缓冲
+		"-flags", "low_delay",    // 低延迟模式
+		"-max_delay", "5000000", // 5 seconds
+		"-fifo_size", "1000000",
+	}
+
+	// 如果启用转码
+	if h.config.EnableTranscoding {
+		if h.config.VideoCodec != "" {
+			args = append(args, "-c:v", h.config.VideoCodec)
+		} else {
+			args = append(args, "-c:v", "copy") // 默认复制视频流
 		}
-	}()
-	
-	// 使用evtest监听输入事件
-	go func() {
-		for {
-			fmt.Println("使用evtest监听输入事件...")
-			cmd := exec.Command("timeout", "10", "evtest", "--query", "/dev/input/event0")
-			output, _ := cmd.CombinedOutput()
-			if len(output) > 0 {
-				fmt.Printf("检测到输入事件: %s\n", string(output))
-			}
-			time.Sleep(5 * time.Second)
+		
+		if h.config.AudioCodec != "" {
+			args = append(args, "-c:a", h.config.AudioCodec)
+		} else {
+			args = append(args, "-c:a", "copy") // 默认复制音频流
 		}
-	}()
+	} else {
+		// 不转码，只复制流
+		args = append(args, "-c", "copy")
+	}
+
+	// HLS特定参数
+	args = append(args, []string{
+		"-hls_time", fmt.Sprintf("%d", h.config.SegmentDuration),
+		"-hls_list_size", fmt.Sprintf("%d", h.config.PlaylistSize),
+		"-hls_flags", "delete_segments+append_list+omit_endlist",  // Add omit_endlist flag
+		"-hls_segment_type", "mpegts",
+		"-hls_segment_filename", filepath.Join(h.config.OutputDir, "segment_%03d.ts"),
+		filepath.Join(h.config.OutputDir, "playlist.m3u8"),
+	}...)
+
+	// 创建FFmpeg命令
+	cmd := exec.Command(ffmpegPath, args...)
 	
-	// 使用irw命令直接监听，但处理输出
+	// 捕获错误输出用于调试
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("创建stderr管道失败: %v", err)
+	}
+
+	// 启动命令
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("启动FFmpeg失败: %v", err)
+	}
+
+	h.cmd = cmd
+	h.isRunning = true
+	h.streamActive = true
+
+	// 处理FFmpeg输出
 	go func() {
+		buf := make([]byte, 4096)
 		for {
-			fmt.Println("启动irw监听...")
-			cmd := exec.Command("irw")
-			
-			stdout, err := cmd.StdoutPipe()
+			n, err := stderr.Read(buf)
+			if n > 0 {
+				log.Printf("FFmpeg: %s", string(buf[:n]))
+			}
 			if err != nil {
-				fmt.Printf("无法获取irw输出: %v\n", err)
-				time.Sleep(5 * time.Second)
-				continue
-			}
-			
-			if err := cmd.Start(); err != nil {
-				fmt.Printf("启动irw失败: %v\n", err)
-				time.Sleep(5 * time.Second)
-				continue
-			}
-			
-			scanner := bufio.NewScanner(stdout)
-			irwActive := true
-			
-			go func() {
-				// 20秒后终止irw
-				time.Sleep(20 * time.Second)
-				if irwActive {
-					cmd.Process.Kill()
-					irwActive = false
+				if err != io.EOF {
+					h.mutex.Lock()
+					h.lastError = fmt.Errorf("读取FFmpeg输出错误: %v", err)
+					h.mutex.Unlock()
 				}
-			}()
-			
-			for scanner.Scan() {
-				line := scanner.Text()
-				fmt.Printf("irw接收到: %s\n", line)
-				
-				// 处理irw输出行
-				parts := strings.Fields(line)
-				if len(parts) >= 3 {
-					buttonName := parts[1]
-					if handler, ok := commandMap[buttonName]; ok {
-						handler()
-					} else {
-						fmt.Printf("未映射的按键: %s\n", buttonName)
-					}
-				}
+				break
 			}
-			
-			irwActive = false
-			cmd.Wait()
-			time.Sleep(10 * time.Second)
+		}
+	}()
+
+	// 监控FFmpeg进程
+	go func() {
+		err := cmd.Wait()
+		h.mutex.Lock()
+		defer h.mutex.Unlock()
+		
+		h.isRunning = false
+		if err != nil {
+			h.lastError = fmt.Errorf("FFmpeg进程退出: %v", err)
+		}
+		log.Printf("转码进程已结束, 错误: %v", h.lastError)
+		
+		// 重启转码，如果流仍然活跃
+		if h.streamActive {
+			log.Println("尝试自动重启转码...")
+			h.mutex.Unlock() // 临时释放锁，防止死锁
+			err := h.StartTranscoding(rtpAddress)
+			h.mutex.Lock() // 重新获取锁
+			if err != nil {
+				log.Printf("重启转码失败: %v", err)
+			}
+		}
+	}()
+
+	log.Printf("开始将RTP流(%s)转为HLS", rtpAddress)
+	return nil
+}
+
+// StopTranscoding 停止转码进程
+func (h *HLSManager) StopTranscoding() error {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+
+	h.streamActive = false
+
+	if !h.isRunning || h.cmd == nil {
+		return nil
+	}
+
+	// 发送终止信号
+	if err := h.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		// 如果失败，强制终止
+		if killErr := h.cmd.Process.Kill(); killErr != nil {
+			return fmt.Errorf("无法终止FFmpeg进程: %v", killErr)
+		}
+	}
+
+	// 等待进程完全退出的超时机制
+	done := make(chan error, 1)
+	go func() {
+		done <- h.cmd.Wait()
+	}()
+
+	select {
+	case <-done:
+		// 进程已经退出
+	case <-time.After(5 * time.Second):
+		// 超时，强制终止
+		if err := h.cmd.Process.Kill(); err != nil {
+			return fmt.Errorf("强制终止FFmpeg超时: %v", err)
+		}
+	}
+
+	h.isRunning = false
+	h.cmd = nil
+	log.Println("HLS转码已停止")
+	return nil
+}
+
+// IsRunning 检查转码是否在运行
+func (h *HLSManager) IsRunning() bool {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	return h.isRunning
+}
+
+// GetLastError 获取最后一个错误
+func (h *HLSManager) GetLastError() error {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	return h.lastError
+}
+
+// RegisterHLSHandlers 注册HLS相关的HTTP处理函数
+func RegisterHLSHandlers(hlsManager *HLSManager) {
+	http.HandleFunc("/hls/", func(w http.ResponseWriter, r *http.Request) {
+		// CORS头
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		
+		// 获取请求的文件路径
+		requestPath := strings.TrimPrefix(r.URL.Path, "/hls/")
+		filePath := filepath.Join(hlsManager.config.OutputDir, requestPath)
+		
+		// 安全检查：确保路径不跳出指定目录
+		if !strings.HasPrefix(filepath.Clean(filePath), filepath.Clean(hlsManager.config.OutputDir)) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		
+		// 设置恰当的内容类型
+		if strings.HasSuffix(filePath, ".m3u8") {
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		} else if strings.HasSuffix(filePath, ".ts") {
+			w.Header().Set("Content-Type", "video/mp2t")
+		}
+		
+		// 提供文件
+		http.ServeFile(w, r, filePath)
+	})
+
+	// HLS转码控制API
+	http.HandleFunc("/api/hls/start", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		
+		// 从请求中获取RTP地址
+		rtpAddr := r.URL.Query().Get("rtp_addr")
+		if rtpAddr == "" {
+			rtpAddr = multicastAddr // 使用默认多播地址
+		}
+		
+		// 启动转码
+		err := hlsManager.StartTranscoding(rtpAddr)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("启动转码失败: %v", err), http.StatusInternalServerError)
+			return
+		}
+		
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "success",
+			"message": fmt.Sprintf("正在将RTP流(%s)转为HLS", rtpAddr),
+		})
+	})
+	
+	http.HandleFunc("/api/hls/stop", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		
+		// 停止转码
+		err := hlsManager.StopTranscoding()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("停止转码失败: %v", err), http.StatusInternalServerError)
+			return
+		}
+		
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "success",
+			"message": "HLS转码已停止",
+		})
+	})
+	
+	http.HandleFunc("/api/hls/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		
+		status := map[string]interface{}{
+			"running": hlsManager.IsRunning(),
+		}
+		
+		if err := hlsManager.GetLastError(); err != nil {
+			status["error"] = err.Error()
+		}
+		
+		json.NewEncoder(w).Encode(status)
+	})
+}
+
+// 添加HLS播放器页面
+func addHLSPlayer(hlsManager *HLSManager) {
+	http.HandleFunc("/hls-player", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+		html := `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>HLS流播放器</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                .container { max-width: 800px; margin: 0 auto; }
+                .form-group { margin-bottom: 15px; }
+                label { display: block; margin-bottom: 5px; }
+                input, button { padding: 8px; }
+                button { cursor: pointer; margin-right: 10px; }
+                video { width: 100%; max-height: 450px; background: #000; }
+                .controls { margin-top: 15px; }
+            </style>
+            <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+        </head>
+        <body>
+            <div class="container">
+                <h1>HLS流播放器</h1>
+                
+                <div id="videoContainer">
+                    <video id="video" controls></video>
+                </div>
+                
+                <div class="controls">
+                    <div class="form-group">
+                        <label for="rtpAddr">RTP流地址(如需自定义)</label>
+                        <input type="text" id="rtpAddr" placeholder="224.30.30.226:8245">
+                    </div>
+                    
+                    <button id="startBtn">开始转码并播放</button>
+                    <button id="stopBtn">停止转码</button>
+                </div>
+                
+                <div id="status" style="margin-top: 15px;"></div>
+            </div>
+            
+            <script>
+                const video = document.getElementById('video');
+                const startBtn = document.getElementById('startBtn');
+                const stopBtn = document.getElementById('stopBtn');
+                const rtpAddrInput = document.getElementById('rtpAddr');
+                const statusDiv = document.getElementById('status');
+                let hlsPlayer = null;
+                
+                function showStatus(message, isError = false) {
+                    statusDiv.textContent = message;
+                    statusDiv.style.color = isError ? 'red' : 'green';
+                }
+                
+                // 检查HLS.js是否可用
+                if (Hls.isSupported()) {
+                    setupHlsPlayer();
+                } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                    // 对于支持HLS但不支持HLS.js的设备(如iOS的Safari)
+                    video.src = '/hls/playlist.m3u8';
+                    video.addEventListener('loadedmetadata', function() {
+                        showStatus('使用原生HLS支持播放');
+                    });
+                } else {
+                    showStatus('您的浏览器不支持HLS播放', true);
+                }
+                
+                function setupHlsPlayer() {
+                    if (hlsPlayer) {
+                        hlsPlayer.destroy();
+                    }
+                    
+                    hlsPlayer = new Hls({
+                        debug: false,
+                        enableWorker: true,
+                        lowLatencyMode: true,
+                    });
+                    
+                    hlsPlayer.attachMedia(video);
+                    hlsPlayer.on(Hls.Events.MEDIA_ATTACHED, function() {
+                        hlsPlayer.loadSource('/hls/playlist.m3u8');
+                    });
+                    
+                    hlsPlayer.on(Hls.Events.MANIFEST_PARSED, function() {
+                        showStatus('HLS流已加载，正在播放');
+                        video.play();
+                    });
+                    
+                    hlsPlayer.on(Hls.Events.ERROR, function(event, data) {
+                        if (data.fatal) {
+                            switch(data.type) {
+                                case Hls.ErrorTypes.NETWORK_ERROR:
+                                    // 尝试重连
+                                    showStatus('网络错误，尝试重连...', true);
+                                    hlsPlayer.startLoad();
+                                    break;
+                                case Hls.ErrorTypes.MEDIA_ERROR:
+                                    showStatus('媒体错误，尝试恢复...', true);
+                                    hlsPlayer.recoverMediaError();
+                                    break;
+                                default:
+                                    // 无法恢复的错误
+                                    showStatus('播放错误: ' + data.details, true);
+                                    hlsPlayer.destroy();
+                                    break;
+                            }
+                        }
+                    });
+                }
+                
+                // 启动转码并播放
+                startBtn.addEventListener('click', async function() {
+                    let rtpAddr = rtpAddrInput.value.trim();
+                    
+                    // 显示加载状态
+                    showStatus('正在启动转码...');
+                    startBtn.disabled = true;
+                    
+                    try {
+                        // 构建API请求URL
+                        let apiUrl = '/api/hls/start';
+                        if (rtpAddr) {
+                            apiUrl += '?rtp_addr=' + encodeURIComponent(rtpAddr);
+                        }
+                        
+                        // 发送启动请求
+                        const response = await fetch(apiUrl, {method: 'POST'});
+                        const result = await response.json();
+                        
+                        if (response.ok) {
+                            showStatus('转码已启动，准备播放');
+                            
+                            // 等待几秒后初始化播放器
+                            setTimeout(() => {
+                                if (Hls.isSupported()) {
+                                    setupHlsPlayer();
+                                } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                                    video.src = '/hls/playlist.m3u8';
+                                    video.play();
+                                }
+                            }, 3000);
+                        } else {
+                            showStatus('启动转码失败: ' + result.message, true);
+                        }
+                    } catch (error) {
+                        showStatus('请求错误: ' + error.message, true);
+                    } finally {
+                        startBtn.disabled = false;
+                    }
+                });
+                
+                // 停止转码
+                stopBtn.addEventListener('click', async function() {
+                    try {
+                        // 发送停止请求
+                        const response = await fetch('/api/hls/stop', {method: 'POST'});
+                        const result = await response.json();
+                        
+                        if (response.ok) {
+                            showStatus('转码已停止');
+                            
+                            // 停止播放器
+                            if (hlsPlayer) {
+                                hlsPlayer.destroy();
+                                hlsPlayer = null;
+                            }
+                            video.pause();
+                            video.removeAttribute('src');
+                            video.load();
+                        } else {
+                            showStatus('停止转码失败: ' + result.message, true);
+                        }
+                    } catch (error) {
+                        showStatus('请求错误: ' + error.message, true);
+                    }
+                });
+                
+                // 页面加载时检查转码状态
+                async function checkTranscodingStatus() {
+                    try {
+                        const response = await fetch('/api/hls/status');
+                        const result = await response.json();
+                        
+                        if (result.running) {
+                            showStatus('转码已在运行，可以播放');
+                            
+                            // 初始化播放器
+                            if (Hls.isSupported()) {
+                                setupHlsPlayer();
+                            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                                video.src = '/hls/playlist.m3u8';
+                                video.play();
+                            }
+                        }
+                    } catch (error) {
+                        console.error('检查转码状态失败:', error);
+                    }
+                }
+                
+                // 页面加载时检查状态
+                window.addEventListener('DOMContentLoaded', checkTranscodingStatus);
+            </script>
+        </body>
+        </html>
+        `
+        w.Write([]byte(html))
+    })
+}
+
+type HDMIPlayer struct {
+	mutex        sync.Mutex
+	cmd          *exec.Cmd
+	isPlaying    bool
+	playingURL   string
+	lastError    error
+	playerBin    string // omxplayer或其他播放器路径
+}
+
+// NewHDMIPlayer 创建新的HDMI播放器
+func NewHDMIPlayer(playerBin string) *HDMIPlayer {
+	// 如果未指定播放器路径，默认使用cvlc (命令行版VLC)
+	if playerBin == "" {
+		playerBin = "cvlc"
+	}
+	
+	return &HDMIPlayer{
+		playerBin: playerBin,
+		isPlaying: false,
+	}
+}
+
+// StartPlay 开始通过HDMI播放RTP流
+func (h *HDMIPlayer) StartPlay(rtpURL string) error {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	
+	if h.isPlaying {
+		return fmt.Errorf("已有视频正在播放")
+	}
+	
+	// 检查播放器是否存在
+	_, err := exec.LookPath(h.playerBin)
+	if err != nil {
+		return fmt.Errorf("找不到播放器 %s: %v", h.playerBin, err)
+	}
+	
+	// 构建播放命令
+	var args []string
+	
+	// 使用不同播放器的对应参数
+	if h.playerBin == "omxplayer" {
+		args = []string{
+			"--live",              // 低延迟模式
+			"--adev", "hdmi",      // 音频输出到HDMI
+			"--no-osd",            // 不显示屏幕信息
+			"--timeout", "30",     // 连接超时时间
+			"--avdict", "rtsp_transport:udp", // 使用UDP传输
+			rtpURL,
+		}
+	} else if strings.HasSuffix(h.playerBin, "vlc") || strings.HasSuffix(h.playerBin, "cvlc") {
+		// VLC命令行参数
+		args = []string{
+			"--fullscreen",        // 全屏显示
+			"--no-video-title",    // 不显示标题
+			"--aout=alsa",         // 使用ALSA而非PulseAudio进行音频输出
+			"--network-caching=100", // 低缓存值用于降低延迟
+			"--file-caching=100",
+			"--sout-mux-caching=100",
+			"--no-audio-time-stretch", // 禁用时间拉伸
+			"--no-video-deco",      // 无装饰
+			"--quiet",              // 减少错误信息
+			rtpURL,                // 播放URL
+			"vlc://quit",          // 播放完毕后退出
+		}
+	} else {
+		// 通用参数，只传入URL
+		args = []string{rtpURL}
+	}
+	
+	// 创建命令
+	cmd := exec.Command(h.playerBin, args...)
+	
+	// 捕获输出用于调试
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("创建stdout管道失败: %v", err)
+	}
+	
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("创建stderr管道失败: %v", err)
+	}
+	
+	// 启动命令
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("启动播放器失败: %v", err)
+	}
+	
+	h.cmd = cmd
+	h.isPlaying = true
+	h.playingURL = rtpURL
+	h.lastError = nil
+	
+	// 处理输出
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := stdout.Read(buf)
+			if n > 0 {
+				log.Printf("播放器输出: %s", string(buf[:n]))
+			}
+			if err != nil {
+				break
+			}
 		}
 	}()
 	
-	// 原始socket监听
-	scanner := bufio.NewScanner(conn)
-	fmt.Println("等待LIRC socket信号...")
-	
-	for scanner.Scan() {
-		line := scanner.Text()
-		fmt.Printf("从socket接收到信号: %s\n", line)
-		
-		// LIRC通常会发送类似这样的数据: <code> <repeat count> <button name> <remote name>
-		parts := strings.Fields(line)
-		
-		// 检查是否是按键信号
-		if len(parts) >= 4 && parts[0] != "BEGIN" && parts[0] != "END" && 
-		   parts[0] != "ERROR" && parts[0] != "DATA" {
-			
-			code := parts[0]
-			repeatCount := parts[1]
-			buttonName := parts[2]
-			remoteName := parts[3]
-			
-			fmt.Printf("解析信号: 代码=%s, 重复次数=%s, 按键=%s, 遥控器=%s\n", 
-					   code, repeatCount, buttonName, remoteName)
-			
-			// 只处理一次按键，忽略重复信号
-			if repeatCount == "00" {
-				if handler, ok := commandMap[buttonName]; ok {
-					handler()
-				} else {
-					fmt.Printf("接收到未映射的按键: %s (来自遥控器: %s)\n", buttonName, remoteName)
-				}
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := stderr.Read(buf)
+			if n > 0 {
+				log.Printf("播放器错误: %s", string(buf[:n]))
 			}
-		} else if strings.Contains(line, "error") || strings.Contains(line, "ERROR") {
-			fmt.Printf("LIRC错误: %s\n", line)
+			if err != nil {
+				break
+			}
+		}
+	}()
+	
+	// 监控播放进程
+	go func() {
+		err := cmd.Wait()
+		h.mutex.Lock()
+		defer h.mutex.Unlock()
+		
+		h.isPlaying = false
+		h.cmd = nil
+		
+		if err != nil && err.Error() != "exit status 0" {
+			h.lastError = fmt.Errorf("播放器退出: %v", err)
+			log.Printf("播放停止，错误: %v", err)
+		} else {
+			log.Println("播放正常结束")
+		}
+	}()
+	
+	log.Printf("开始通过HDMI播放RTP流: %s", rtpURL)
+	return nil
+}
+
+// StopPlay 停止播放
+func (h *HDMIPlayer) StopPlay() error {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	
+	if (!h.isPlaying || h.cmd == nil) {
+		return nil // 已经停止了
+	}
+	
+	// 向进程发送退出命令
+	if h.playerBin == "omxplayer" {
+		// omxplayer 特定的停止逻辑
+		if err := h.cmd.Process.Signal(syscall.SIGINT); err != nil {
+			log.Printf("发送SIGINT失败: %v，尝试强制终止", err)
+		} else {
+			// 给一点时间优雅退出
+			time.Sleep(500 * time.Millisecond)
+		}
+	} else if strings.HasSuffix(h.playerBin, "vlc") || strings.HasSuffix(h.playerBin, "cvlc") {
+		// VLC 可以用 SIGTERM 或 SIGINT 信号终止
+		if err := h.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			log.Printf("发送SIGTERM到VLC失败: %v，尝试强制终止", err)
+		} else {
+			// 给VLC一点时间优雅退出
+			time.Sleep(1000 * time.Millisecond)
 		}
 	}
 	
-	if err := scanner.Err(); err != nil {
-		fmt.Println("读取LIRC数据出错:", err)
-	}
-	
-	fmt.Println("信号处理循环结束")
-}
-
-// 检查遥控器是否工作
-func checkRemoteWorking() {
-	fmt.Println("检查遥控器是否工作...")
-	
-	// 检查mode2能否直接接收IR信号
-	cmd := exec.Command("timeout", "5", "mode2", "-d", "/dev/lirc0")
-	fmt.Println("开始检测IR信号，请按下遥控器按钮...")
-	output, err := cmd.CombinedOutput()
-	
-	if err != nil && !strings.Contains(err.Error(), "exit status") {
-		fmt.Printf("mode2测试失败: %v\n", err)
-		fmt.Println("请确保IR接收器连接正确，且您的遥控器能发出IR信号")
-	} else if len(output) > 0 {
-		fmt.Println("检测到IR原始信号，接收器工作正常")
-		fmt.Printf("原始信号样本: %s\n", string(output)[:min(100, len(output))])
-	} else {
-		fmt.Println("未检测到IR信号，请检查:")
-		fmt.Println("1. 遥控器电池是否正常")
-		fmt.Println("2. 遥控器是否正对IR接收器")
-		fmt.Println("3. IR接收器是否正确连接到GPIO")
-	}
-	
-	// 检查LIRC配置是否包含您的遥控器
-	checkLircRemotes()
-}
-
-// 检查LIRC中的遥控器配置
-func checkLircRemotes() {
-	fmt.Println("检查LIRC遥控器配置...")
-	
-	// 检查配置目录中的文件
-	cmd := exec.Command("ls", "-la", "/etc/lirc/lircd.conf.d/")
-	output, _ := cmd.CombinedOutput()
-	fmt.Printf("LIRC配置目录内容:\n%s\n", string(output))
-	
-	// 逐个检查可能的配置文件
-	possibleConfigs := []string{
-		"/etc/lirc/lircd.conf.d/devinput.lircd.conf",
-		"/etc/lirc/lircd.conf",
-		"/etc/lirc/lircd.conf.d/hello.conf",
-	}
-	
-	foundConfig := false
-	
-	for _, configPath := range possibleConfigs {
-		if _, err := os.Stat(configPath); err == nil {
-			fmt.Printf("发现配置文件: %s\n", configPath)
-			
-			// 读取文件内容
-			data, err := os.ReadFile(configPath)
-			if err == nil {
-				fmt.Printf("配置文件内容样本:\n")
-				
-				// 只显示前500个字符
-				content := string(data)
-				if len(content) > 500 {
-					content = content[:500] + "..."
-				}
-				fmt.Println(content)
-				
-				// 检查是否包含按键定义
-				if strings.Contains(content, "KEY_") {
-					fmt.Println("配置包含有效的按键定义")
-					foundConfig = true
-				}
+	// 如果进程仍在运行，发送终止信号
+	if h.cmd.ProcessState == nil || !h.cmd.ProcessState.Exited() {
+		if err := h.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			// 如果失败，强制终止
+			if killErr := h.cmd.Process.Kill(); killErr != nil {
+				return fmt.Errorf("无法终止播放进程: %v", killErr)
 			}
 		}
 	}
 	
-	if !foundConfig {
-		fmt.Println("未找到有效的遥控器配置定义")
-		fmt.Println("将尝试使用直接IR输入模式")
-	}
-}
-
-// 辅助函数，返回两个int的较小值
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// 添加一个诊断函数来测试LIRC接收功能
-func testLircReceiving() {
-	fmt.Println("测试LIRC接收功能...")
+	// 等待进程完全退出的超时机制
+	done := make(chan error, 1)
+	go func() {
+		done <- h.cmd.Wait()
+	}()
 	
-	// 使用irw命令来测试接收
-	cmd := exec.Command("timeout", "5", "irw")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	
-	fmt.Println("请在5秒内按下遥控器按钮...")
-	err := cmd.Run()
-	
-	if err != nil && err.Error() != "exit status 124" { // timeout正常退出码是124
-		fmt.Printf("irw测试失败: %v\n", err)
-		fmt.Println("这可能意味着您的IR接收器没有正确设置")
-	} else {
-		fmt.Println("irw测试完成")
-	}
-}
-
-// 检查LIRC是否已安装并运行
-func checkLIRCInstallation() bool {
-	// 检查LIRC服务是否运行
-	cmd := exec.Command("systemctl", "is-active", "lircd")
-	output, err := cmd.Output()
-	if err != nil {
-		fmt.Printf("检查LIRC服务状态出错: %v\n", err)
-		return false
-	}
-	
-	isActive := strings.TrimSpace(string(output)) == "active"
-	if !isActive {
-		// 尝试其他方法检查
-		cmd = exec.Command("pgrep", "lircd")
-		output, err = cmd.Output()
-		if err == nil && len(output) > 0 {
-			fmt.Println("LIRC进程正在运行，但systemd服务可能不活跃")
-			return true
+	select {
+	case <-done:
+		// 进程已经退出
+	case <-time.After(3 * time.Second):
+		// 超时，强制终止
+		if h.cmd.Process != nil {
+			if err := h.cmd.Process.Kill(); err != nil {
+				return fmt.Errorf("强制终止播放器超时: %v", err)
+			}
 		}
 	}
 	
-	return isActive
+	h.isPlaying = false
+	h.cmd = nil
+	h.playingURL = ""
+	log.Println("HDMI播放已停止")
+	return nil
 }
 
-func testLircConfig() {
-	// 测试LIRC配置
-	cmd := exec.Command("irsend", "LIST", "", "")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Printf("获取LIRC配置失败: %v\n", err)
-		fmt.Println("请确保已经配置了遥控器:")
-		fmt.Println("1. 运行 'sudo irrecord -d /dev/lirc0 ~/lircd.conf' 创建配置")
-		fmt.Println("2. 复制配置 'sudo cp ~/lircd.conf /etc/lirc/lircd.conf.d/'")
-		fmt.Println("3. 重启LIRC 'sudo systemctl restart lircd'")
-	} else {
-		fmt.Printf("LIRC配置信息:\n%s\n", string(output))
-	}
+// IsPlaying 检查是否正在播放
+func (h *HDMIPlayer) IsPlaying() bool {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	return h.isPlaying
 }
 
-// 检查硬件配置
-func checkHardwareConfig() {
-	// 检查config.txt文件中的dtoverlay设置
-	// 支持不同版本的Raspberry Pi OS中可能的config.txt位置
-	configPaths := []string{
-		"/boot/firmware/config.txt",  // 较新版本的Raspberry Pi OS
-		"/boot/config.txt",           // 传统版本的Raspberry Pi OS
-	}
-	
-	configFound := false
-	var configPath string
-	var output []byte
-	
-	for _, path := range configPaths {
-		if _, err := os.Stat(path); err == nil {
-			configPath = path
-			configFound = true
-			
-			cmd := exec.Command("grep", "dtoverlay=gpio-ir", path)
-			output, _ = cmd.CombinedOutput()
-			
-			fmt.Printf("使用配置文件: %s\n", path)
-			break
+// GetPlayingURL 获取当前播放的URL
+func (h *HDMIPlayer) GetPlayingURL() string {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	return h.playingURL
+}
+
+// GetLastError 获取最后一个错误
+func (h *HDMIPlayer) GetLastError() error {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	return h.lastError
+}
+
+// 注册HDMI播放相关的API处理函数
+func RegisterHDMIHandlers(hdmiPlayer *HDMIPlayer) {
+	// 开始HDMI播放API
+	http.HandleFunc("/api/hdmi/play", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
 		}
-	}
+		
+		if r.Method != http.MethodPost && r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		
+		// 获取RTP地址
+		rtpURL := r.URL.Query().Get("url")
+		if rtpURL == "" {
+			// 如果未指定，使用默认多播地址
+			rtpURL = "rtp://" + multicastAddr
+		}
+		
+		// 启动播放
+		err := hdmiPlayer.StartPlay(rtpURL)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("启动HDMI播放失败: %v", err), http.StatusInternalServerError)
+			return
+		}
+		
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "success",
+			"message": fmt.Sprintf("正在通过HDMI播放 %s", rtpURL),
+			"url": rtpURL,
+		})
+	})
 	
-	if !configFound {
-		fmt.Println("警告: 未找到config.txt文件")
-		fmt.Println("请确认您的Raspberry Pi OS版本以及config.txt的位置")
-		return
-	}
+	// 停止HDMI播放API
+	http.HandleFunc("/api/hdmi/stop", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		
+		if r.Method != http.MethodPost && r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		
+		// 停止播放
+		err := hdmiPlayer.StopPlay()
+		if err != nil {
+			http.Error(w, fmt.Sprintf("停止HDMI播放失败: %v", err), http.StatusInternalServerError)
+			return
+		}
+		
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "success",
+			"message": "HDMI播放已停止",
+		})
+	})
 	
-	if len(output) == 0 {
-		fmt.Printf("警告: 没有在%s中找到gpio-ir配置\n", configPath)
-		fmt.Println("您可能需要添加以下行到config.txt:")
-		fmt.Println("dtoverlay=gpio-ir,gpio_pin=18")  // 通常使用GPIO18作为IR接收器
-		fmt.Println("然后重启树莓派")
-	} else {
-		fmt.Printf("找到IR配置: %s\n", string(output))
-	}
-	
-	// 检查/dev/lirc0是否存在
-	if _, err := os.Stat("/dev/lirc0"); os.IsNotExist(err) {
-		fmt.Println("警告: /dev/lirc0设备不存在")
-		fmt.Println("这可能意味着IR接收器驱动没有正确加载")
-	} else {
-		fmt.Println("IR设备 /dev/lirc0 存在")
-	}
+	// 查询HDMI播放状态API
+	http.HandleFunc("/api/hdmi/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		
+		status := map[string]interface{}{
+			"playing": hdmiPlayer.IsPlaying(),
+		}
+		
+		if hdmiPlayer.IsPlaying() {
+			status["url"] = hdmiPlayer.GetPlayingURL()
+		}
+		
+		if err := hdmiPlayer.GetLastError(); err != nil {
+			status["error"] = err.Error()
+		}
+		
+		json.NewEncoder(w).Encode(status)
+	})
 }
 
-// 检查系统中可用的输入设备
-func checkInputDevices() {
-	fmt.Println("检查系统输入设备...")
-	
-	// 列出所有输入设备
-	cmd := exec.Command("ls", "-la", "/dev/input/")
-	output, _ := cmd.CombinedOutput()
-	fmt.Printf("输入设备列表:\n%s\n", string(output))
-	
-	// 使用evtest查看设备详情
-	cmd = exec.Command("timeout", "1", "evtest", "--info")
-	output, _ = cmd.CombinedOutput()
-	if len(output) > 0 {
-		fmt.Printf("输入设备信息:\n%s\n", string(output))
+// 添加HDMI控制页面
+func addHDMIController(hdmiPlayer *HDMIPlayer, rtpServer *RTPServer) {
+	http.HandleFunc("/hdmi-controller", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=UTF-8")
+		html := `
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>HDMI播放控制器</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                .container { max-width: 800px; margin: 0 auto; }
+                .form-group { margin-bottom: 15px; }
+                label { display: block; margin-bottom: 5px; }
+                input, button, select { padding: 8px; }
+                button { cursor: pointer; margin-right: 10px; }
+                .controls { margin-top: 20px; }
+                .status { margin-top: 20px; padding: 10px; background-color: #f5f5f5; border-radius: 5px; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>树莓派HDMI播放控制</h1>
+                
+                <div class="form-group">
+                    <label for="rtpURL">RTP流地址</label>
+                    <input type="text" id="rtpURL" style="width: 70%;" placeholder="udp://224.30.30.226:8245">
+                    <button id="useDefault">使用默认</button>
+                </div>
+                
+                <div class="form-group">
+                    <label>多播地址选择</label>
+                    <select id="multicastSelect" style="width: 70%;">
+                        <option value="">加载中...</option>
+                    </select>
+                    <button id="refreshMulticast">刷新</button>
+                </div>
+                
+                <div class="controls">
+                    <button id="playBtn" class="primary">开始播放</button>
+                    <button id="stopBtn">停止播放</button>
+                </div>
+                
+                <div class="status" id="status">
+                    <h3>播放状态</h3>
+                    <div id="statusContent">
+                        正在检查...
+                    </div>
+                </div>
+            </div>
+            
+            <script>
+                const rtpURLInput = document.getElementById('rtpURL');
+                const useDefaultBtn = document.getElementById('useDefault');
+                const playBtn = document.getElementById('playBtn');
+                const stopBtn = document.getElementById('stopBtn');
+                const multicastSelect = document.getElementById('multicastSelect');
+                const refreshMulticastBtn = document.getElementById('refreshMulticast');
+                const statusContent = document.getElementById('statusContent');
+                
+                // 默认RTP地址
+                const defaultRtpURL = 'rtp://224.30.30.226:8245';
+                
+                // 使用默认地址
+                useDefaultBtn.addEventListener('click', function() {
+                    rtpURLInput.value = defaultRtpURL;
+                });
+                
+                // 加载多播地址列表
+                async function loadMulticastAddresses() {
+                    try {
+                        const response = await fetch('/api/multicast/list');
+                        if (response.ok) {
+                            const data = await response.json();
+                            multicastSelect.innerHTML = '';
+                            
+                            if (data.length === 0) {
+                                const option = document.createElement('option');
+                                option.value = '';
+                                option.textContent = '无可用多播地址';
+                                multicastSelect.appendChild(option);
+                            } else {
+                                data.forEach(item => {
+                                    const option = document.createElement('option');
+                                    option.value = 'rtp://' + item.address;
+                                    option.textContent = item.address + (item.active ? ' (活跃)' : '');
+                                    if (item.active) {
+                                        option.selected = true;
+                                    }
+                                    multicastSelect.appendChild(option);
+                                });
+                            }
+                        } else {
+                            multicastSelect.innerHTML = '<option value="">无法加载多播地址</option>';
+                        }
+                    } catch (error) {
+                        multicastSelect.innerHTML = '<option value="">加载失败: ' + error.message + '</option>';
+                    }
+                }
+                
+                // 刷新多播地址列表
+                refreshMulticastBtn.addEventListener('click', loadMulticastAddresses);
+                
+                // 从多播下拉框选择地址
+                multicastSelect.addEventListener('change', function() {
+                    if (multicastSelect.value) {
+                        rtpURLInput.value = multicastSelect.value;
+                    }
+                });
+                
+                // 开始播放
+                playBtn.addEventListener('click', async function() {
+                    const rtpURL = rtpURLInput.value.trim() || defaultRtpURL;
+                    
+                    try {
+                        playBtn.disabled = true;
+                        statusContent.textContent = '正在启动播放...';
+                        
+                        const response = await fetch('/api/hdmi/play?url=' + encodeURIComponent(rtpURL), {
+                            method: 'POST'
+                        });
+                        
+                        const result = await response.json();
+                        
+                        if (response.ok) {
+                            statusContent.textContent = '播放已开始: ' + rtpURL;
+                            updateStatus(); // 立即更新状态
+                        } else {
+                            statusContent.textContent = '启动播放失败: ' + (result.message || response.statusText);
+                        }
+                    } catch (error) {
+                        statusContent.textContent = '请求错误: ' + error.message;
+                    } finally {
+                        playBtn.disabled = false;
+                    }
+                });
+                
+                // 停止播放
+                stopBtn.addEventListener('click', async function() {
+                    try {
+                        stopBtn.disabled = true;
+                        statusContent.textContent = '正在停止播放...';
+                        
+                        const response = await fetch('/api/hdmi/stop', {
+                            method: 'POST'
+                        });
+                        
+                        const result = await response.json();
+                        
+                        if (response.ok) {
+                            statusContent.textContent = '播放已停止';
+                            updateStatus(); // 立即更新状态
+                        } else {
+                            statusContent.textContent = '停止播放失败: ' + (result.message || response.statusText);
+                        }
+                    } catch (error) {
+                        statusContent.textContent = '请求错误: ' + error.message;
+                    } finally {
+                        stopBtn.disabled = false;
+                    }
+                });
+                
+                // 定期更新状态
+                async function updateStatus() {
+                    try {
+                        const response = await fetch('/api/hdmi/status');
+                        if (response.ok) {
+                            const status = await response.json();
+                            
+                            if (status.playing) {
+                                statusContent.innerHTML = '<div style="color: green;">正在播放</div>' +
+                                                        '<div>URL: ' + (status.url || '未知') + '</div>';
+                                playBtn.disabled = true;
+                                stopBtn.disabled = false;
+                            } else {
+                                statusContent.innerHTML = '<div>未播放</div>';
+                                if (status.error) {
+                                    statusContent.innerHTML += '<div style="color: red;">错误: ' + status.error + '</div>';
+                                }
+                                playBtn.disabled = false;
+                                stopBtn.disabled = true;
+                            }
+                        } else {
+                            statusContent.textContent = '无法获取状态: ' + response.statusText;
+                        }
+                    } catch (error) {
+                        statusContent.textContent = '状态更新错误: ' + error.message;
+                    }
+                }
+                
+                // 页面加载时执行
+                window.addEventListener('DOMContentLoaded', function() {
+                    loadMulticastAddresses();
+                    updateStatus();
+                    
+                    // 定时更新状态
+                    setInterval(updateStatus, 5000);
+                });
+            </script>
+        </body>
+        </html>
+        `
+        w.Write([]byte(html))
+    })
+}
+
+// Channel represents a TV channel from channels.json
+type Channel struct {
+	ChannelID   string `json:"ChannelID"`
+	ChannelName string `json:"ChannelName"`
+	ChannelURL  string `json:"ChannelURL"`
+}
+
+// loadChannels loads the channel list from the JSON file
+func loadChannels(filePath string) ([]Channel, error) {
+	data, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read channels file: %v", err)
 	}
+	
+	var channels []Channel
+	if err := json.Unmarshal(data, &channels); err != nil {
+		return nil, fmt.Errorf("failed to parse channel data: %v", err)
+	}
+	
+	return channels, nil
+}
+
+// TranscodeMKVToMP4 转码MKV文件为MP4文件
+func TranscodeMKVToMP4(inputPath, outputPath string) error {
+	ffmpegPath := "ffmpeg" // 假设ffmpeg在系统路径中
+	args := []string{
+		"-i", inputPath,
+		"-c:v", "libx264", // 使用H.264编码
+		"-c:a", "aac",     // 使用AAC音频编码
+		"-strict", "experimental",
+		"-y", // 覆盖输出文件
+		outputPath,
+	}
+
+	cmd := exec.Command(ffmpegPath, args...)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("转码失败: %v", err)
+	}
+	return nil
 }
 
 func main() {
-	// 设置日志
-	log.SetOutput(os.Stdout)
-	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+	// 添加命令行参数
+	httpPort := flag.Int("port", 8088, "HTTP服务器端口")
+	videoDir := flag.String("videos", "/mnt/nvme/videos", "视频文件目录")
 	
-	fmt.Println("开始接收遥控器信号...")
+	// 添加HLS相关参数
+	hlsDir := flag.String("hls-dir", "./hls", "HLS输出目录")
+	hlsSegDuration := flag.Int("hls-segment", 4, "HLS段时长(秒)")
+	hlsListSize := flag.Int("hls-list-size", 5, "HLS播放列表大小")
+	ffmpegPath := flag.String("ffmpeg", "ffmpeg", "FFmpeg可执行文件路径")
+	enableTranscode := flag.Bool("transcode", false, "启用视频转码(需更多CPU)")
+	videoCodec := flag.String("vcodec", "", "视频编码(如h264,libx264)")
+	audioCodec := flag.String("acodec", "", "音频编码(如aac,libfdk_aac)")
 	
-	// 显示LIRC版本信息
-	cmd := exec.Command("lircd", "--version")
-	output, err := cmd.CombinedOutput()
-	if err == nil {
-		fmt.Printf("LIRC版本: %s\n", string(output))
-	} else {
-		fmt.Printf("获取LIRC版本失败: %v\n", err)
+	// 添加HDMI播放器相关参数，默认修改为cvlc
+	hdmiPlayerBin := flag.String("player", "cvlc", "媒体播放器可执行文件路径(默认cvlc)")
+	
+	flag.Parse()
+
+	// 确保视频目录存在
+	if err := os.MkdirAll(*videoDir, 0755); err != nil {
+		log.Fatal("Failed to create video directory:", err)
 	}
 	
-	// 检查LIRC安装
-	if !checkLIRCInstallation() {
-		fmt.Println("LIRC似乎没有正确安装或运行。请运行以下命令安装:")
-		fmt.Println("sudo apt-get install lirc")
-		fmt.Println("然后配置LIRC并启动服务")
-		os.Exit(1)
+	// 确保HLS目录存在
+	if err := os.MkdirAll(*hlsDir, 0755); err != nil {
+		log.Fatal("Failed to create HLS directory:", err)
+	}
+
+	// 配置HLS管理器
+	hlsConfig := HLSConfig{
+		SegmentDuration:  *hlsSegDuration,
+		PlaylistSize:     *hlsListSize,
+		OutputDir:        *hlsDir,
+		FFmpegBin:        *ffmpegPath,
+		EnableTranscoding: *enableTranscode,
+		VideoCodec:       *videoCodec,
+		AudioCodec:       *audioCodec,
 	}
 	
-	// 测试LIRC配置
-	testLircConfig()
+	hlsManager := NewHLSManager(hlsConfig)
 	
-	// 检查遥控器是否工作（新增）
-	checkRemoteWorking()
+	// 注册HLS相关的HTTP处理函数
+	RegisterHLSHandlers(hlsManager)
+	addHLSPlayer(hlsManager)
+
+	// 创建HDMI播放器
+	hdmiPlayer := NewHDMIPlayer(*hdmiPlayerBin)
 	
-	// 改进LIRC配置检查
-	checkLircRemotes()
-	
-	// 测试LIRC接收功能
-	testLircReceiving()
-	
-	// 检查硬件配置
-	checkHardwareConfig()
-	
-	// 添加对输入设备的检查
-	checkInputDevices()
-	
-	// 连接到LIRC
-	conn, err := connectToLIRC()
+	// 启动RTP服务器
+	rtpServer, err := NewRTPServer()
 	if err != nil {
-		fmt.Println(err)
-		fmt.Println("请确保:")
-		fmt.Println("1. LIRC已经安装: sudo apt-get install lirc")
-		fmt.Println("2. LIRC服务正在运行: sudo systemctl start lircd")
-		fmt.Println("3. LIRC已正确配置您的遥控器")
-		os.Exit(1)
+		log.Fatalf("无法创建RTP服务器: %v", err)
 	}
-	defer conn.Close()
 	
-	fmt.Println("成功连接到LIRC，正在等待遥控器信号...")
+	// 注册RTP处理函数
+	// registerRTPHandlers(rtpServer)
 	
-	// 处理信号
-	go processRemoteSignals(conn)
+	// 注册HDMI播放相关的处理函数
+	RegisterHDMIHandlers(hdmiPlayer)
+	addHDMIController(hdmiPlayer, rtpServer)
 	
-	// 防止程序立即退出
-	fmt.Println("主程序继续运行中...")
-	for {
-		time.Sleep(time.Second * 60)
-		fmt.Println("程序仍在运行，等待遥控器信号...")
+	// 启动RTP服务器
+	go rtpServer.Start()
+
+	// 处理视频列表请求
+	http.HandleFunc("/api/playlist", func(w http.ResponseWriter, r *http.Request) {
+		videos := getVideoList(*videoDir, "")
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		json.NewEncoder(w).Encode(videos)
+	})
+
+	// 处理视频文件请求
+	http.HandleFunc("/video/", func(w http.ResponseWriter, r *http.Request) {
+		// CORS 头
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		relativePath := strings.TrimPrefix(r.URL.Path, "/video/")
+		filePath := filepath.Join(*videoDir, relativePath)
+
+		// 安全检查：确保文件路径在videoDir目录下
+		if (!strings.HasPrefix(filepath.Clean(filePath), filepath.Clean(*videoDir))) {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+
+		ext := strings.ToLower(filepath.Ext(relativePath))
+		
+		// Check if iOS client is requesting MKV file
+		userAgent := r.Header.Get("User-Agent")
+		isIOS := strings.Contains(userAgent, "iPhone") || strings.Contains(userAgent, "iPad") || strings.Contains(userAgent, "iPod")
+		
+		if ext == ".mkv" && isIOS {
+			// Create a temporary MP4 file for iOS clients
+			tempDir := filepath.Join(*videoDir, "temp_ios")
+			os.MkdirAll(tempDir, 0755)
+			
+			// Generate output path with same name but mp4 extension
+			baseName := filepath.Base(relativePath)
+			nameWithoutExt := strings.TrimSuffix(baseName, ext)
+			mp4Path := filepath.Join(tempDir, nameWithoutExt + ".mp4")
+			
+			// Check if converted file already exists
+			if _, err := os.Stat(mp4Path); os.IsNotExist(err) {
+				// File doesn't exist, perform conversion
+				log.Printf("Converting MKV to MP4 for iOS client: %s", relativePath)
+				if err := TranscodeMKVToMP4(filePath, mp4Path); err != nil {
+					log.Printf("Conversion failed: %v", err)
+					http.Error(w, "Conversion failed", http.StatusInternalServerError)
+					return
+				}
+			}
+			
+			// Serve the MP4 file instead
+			w.Header().Set("Content-Type", "video/mp4")
+			http.ServeFile(w, r, mp4Path)
+			return
+		}
+		
+		// Continue with normal serving for other cases
+		if ext == ".mkv" {
+			w.Header().Set("Content-Type", "video/mkv")
+		} else {
+			w.Header().Set("Content-Type", "video/mp4")
+		}
+		http.ServeFile(w, r, filePath)
+	})
+
+	// 处理上传视频请求
+	http.HandleFunc("/api/upload", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// 设置10GB的上传限制，适合更大的电视剧文件
+		if err := r.ParseMultipartForm(10 << 30); err != nil {
+			http.Error(w, fmt.Sprintf("Error parsing form: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		file, handler, err := r.FormFile("video")
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error retrieving file: %v", err), http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+
+		// 清理和验证文件名
+		safeName := filepath.Clean(filepath.Base(handler.Filename))
+		ext := strings.ToLower(filepath.Ext(safeName))
+		if ext != ".mp4" && ext != ".webm" && ext != ".mkv" {
+			http.Error(w, "Invalid file type", http.StatusBadRequest)
+			return
+		}
+
+		// 如果文件已存在，添加时间戳
+		dstPath := filepath.Join(*videoDir, safeName)
+		if _, err := os.Stat(dstPath); err == nil {
+			nameWithoutExt := strings.TrimSuffix(safeName, ext)
+			safeName = fmt.Sprintf("%s_%d%s", nameWithoutExt, time.Now().Unix(), ext)
+			dstPath = filepath.Join(*videoDir, safeName)
+		}
+
+		dst, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Error creating file: %v", err), http.StatusInternalServerError)
+			return
+		}
+		defer dst.Close()
+
+		if _, err := io.Copy(dst, file); err != nil {
+			os.Remove(dstPath) // 清理失败的文件
+			http.Error(w, fmt.Sprintf("Error saving file: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte("Upload successful"))
+	})
+
+	// 处理频道列表请求
+	http.HandleFunc("/api/channels", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		
+		channelsFile := filepath.Join(".", "channels.json")
+		channels, err := loadChannels(channelsFile)
+		
+		if err != nil {
+			log.Printf("Error loading channels: %v", err)
+			http.Error(w, "Failed to load channel list", http.StatusInternalServerError)
+			return
+		}
+		
+		json.NewEncoder(w).Encode(channels)
+	})
+
+	// 添加获取客户端IP的API端点
+	http.HandleFunc("/api/client-ip", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		// 获取客户端IP
+		clientIP := getClientIP(r)
+
+		response := map[string]string{"ip": clientIP}
+		json.NewEncoder(w).Encode(response)
+	})
+
+	// 尝试启动HTTP服务器，如果端口被占用，尝试其他端口
+	serverAddr := fmt.Sprintf(":%d", *httpPort)
+	log.Printf("尝试在端口 %d 上启动HTTP服务器", *httpPort)
+
+	server := &http.Server{Addr: serverAddr}
+	if err := server.ListenAndServe(); err != nil {
+		if strings.Contains(err.Error(), "address already in use") {
+			// 尝试其他端口
+			for port := *httpPort + 1; port < *httpPort+10; port++ {
+				serverAddr = fmt.Sprintf(":%d", port)
+				log.Printf("端口 %d 被占用，尝试端口 %d", *httpPort, port)
+				server = &http.Server{Addr: serverAddr}
+				if err := server.ListenAndServe(); err == nil {
+					break
+				}
+				if !strings.Contains(err.Error(), "address already in use") {
+					log.Fatal("HTTP服务器启动失败:", err)
+				}
+			}
+		} else {
+			log.Fatal("HTTP服务器启动失败:", err)
+		}
 	}
+}
+
+const (
+	// RTP服务监听地址
+	rtpListenAddr = ":8554"
+	// 每个数据包的最大大小
+	packetSize = 2048
+	// 多播地址和端口
+	multicastAddr = "224.30.30.226:8245"
+)
+
+// RTPClient 表示接收RTP流的客户端连接
+type RTPClient struct {
+	conn     *net.UDPConn
+	addr     *net.UDPAddr
+	lastSeen int64
+}
+
+// RTPServer 管理RTP流和客户端
+type RTPServer struct {
+	listenConn          *net.UDPConn
+	clients             map[string]*RTPClient
+	mutex               sync.RWMutex
+	sourceAddr          *net.UDPAddr
+	isRunning           bool
+	multicastConns      map[string]*net.UDPConn // 管理多个多播连接
+	multicastMutex      sync.RWMutex
+	activeMulticastAddr string // 当前活跃的多播地址
+	clientsPerMulticast map[string]int // 每个多播地址的客户端数量
+}
+
+// NewRTPServer 创建新的RTP服务器
+func NewRTPServer() (*RTPServer, error) {
+	// 解析监听地址
+	addr, err := net.ResolveUDPAddr("udp", rtpListenAddr)
+	if (err != nil) {
+		return nil, fmt.Errorf("无法解析UDP地址: %v", err)
+	}
+
+	// 创建监听连接
+	conn, err := net.ListenUDP("udp", addr)
+	if (err != nil) {
+		return nil, fmt.Errorf("无法监听UDP: %v", err)
+	}
+
+	return &RTPServer{
+		listenConn:          conn,
+		clients:             make(map[string]*RTPClient),
+		mutex:               sync.RWMutex{},
+		multicastConns:      make(map[string]*net.UDPConn),
+		clientsPerMulticast: make(map[string]int),
+	}, nil
+}
+
+// Start 开始监听和处理RTP数据包
+func (s *RTPServer) Start() {
+	s.isRunning = true
+
+	// 创建停止信号处理
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		s.Stop()
+	}()
+
+	log.Printf("RTP服务器开始在 %s 上监听", rtpListenAddr)
+
+	// 处理接收的RTP数据包
+	buffer := make([]byte, packetSize)
+	for s.isRunning {
+		n, addr, err := s.listenConn.ReadFromUDP(buffer)
+		if err != nil {
+			if s.isRunning {
+				log.Printf("读取UDP数据包错误: %v", err)
+			}
+			continue
+		}
+
+		// 如果是从新的源地址接收的，记录下来
+		if (s.sourceAddr == nil || addr.String() != s.sourceAddr.String()) && s.isRunning {
+			s.sourceAddr = addr
+			log.Printf("从新源接收RTP流: %s", addr.String())
+		}
+
+		// 转发数据包给所有已连接的客户端
+		s.forwardPacket(buffer[:n])
+	}
+}
+
+// JoinMulticastGroup 加入指定的多播组并开始接收数据
+func (s *RTPServer) JoinMulticastGroup(multicastAddrStr string) error {
+	s.multicastMutex.Lock()
+	defer s.multicastMutex.Unlock()
+
+	// 检查是否已经连接到此多播地址
+	if _, exists := s.multicastConns[multicastAddrStr]; exists {
+		// 如果已连接，只设置为活跃
+		if s.activeMulticastAddr != multicastAddrStr {
+			s.activeMulticastAddr = multicastAddrStr
+			log.Printf("已切换到多播地址: %s", multicastAddrStr)
+		}
+		return nil
+	}
+
+	// 如果没有客户端请求此多播地址，暂时不加入
+	// 除非这是明确的加入请求（通过API调用）
+	if s.clientsPerMulticast[multicastAddrStr] == 0 && len(s.clients) == 0 {
+		// 记录为活跃，但实际上不连接，直到有客户端
+		s.activeMulticastAddr = multicastAddrStr
+		log.Printf("已设置多播地址为活跃（等待客户端连接）: %s", multicastAddrStr)
+		return nil
+	}
+
+	// 解析多播地址
+	mcAddr, err := net.ResolveUDPAddr("udp", multicastAddrStr)
+	if err != nil {
+		return fmt.Errorf("无法解析多播地址: %v", err)
+	}
+
+	// 尝试连接到多播组
+	conn, err := net.ListenMulticastUDP("udp4", nil, mcAddr)
+	if err != nil {
+		// 如果第一次尝试失败，使用明确的接口尝试
+		success := false
+		interfaces, errIface := net.Interfaces()
+		if errIface == nil {
+			for _, iface := range interfaces {
+				// 跳过不支持多播、未激活或环回接口
+				if iface.Flags&net.FlagMulticast == 0 ||
+					iface.Flags&net.FlagUp == 0 ||
+					iface.Flags&net.FlagLoopback != 0 {
+					continue
+				}
+
+				conn, err = net.ListenMulticastUDP("udp4", &iface, mcAddr)
+				if err != nil {
+					continue
+				}
+
+				success = true
+				log.Printf("在接口 %s 上成功加入多播组 %s", iface.Name, multicastAddrStr)
+				break
+			}
+		}
+
+		if !success {
+			return fmt.Errorf("无法连接到多播组: %v", err)
+		}
+	}
+
+	// 设置接收缓冲区大小
+	if err := conn.SetReadBuffer(1024 * 1024); err != nil {
+		log.Printf("无法设置接收缓冲区大小: %v", err)
+	}
+
+	// 保存连接并设置为活跃
+	s.multicastConns[multicastAddrStr] = conn
+	s.activeMulticastAddr = multicastAddrStr
+
+	log.Printf("成功加入多播组 %v", multicastAddrStr)
+
+	// 启动接收协程
+	go s.receiveMulticast(multicastAddrStr, conn)
+
+	return nil
+}
+
+// LeaveMulticastGroup 离开指定的多播组
+func (s *RTPServer) LeaveMulticastGroup(multicastAddrStr string) error {
+	s.multicastMutex.Lock()
+	defer s.multicastMutex.Unlock()
+
+	conn, exists := s.multicastConns[multicastAddrStr]
+	if !exists {  // Fixed: removed unnecessary parentheses
+		return fmt.Errorf("未连接到多播组 %s", multicastAddrStr)
+	}
+
+	conn.Close()
+	delete(s.multicastConns, multicastAddrStr)
+	log.Printf("已离开多播组 %s", multicastAddrStr)
+
+	// 如果离开的是活跃多播地址，切换到其他地址（如果有）
+	if s.activeMulticastAddr == multicastAddrStr {
+		s.activeMulticastAddr = ""
+		for addr := range s.multicastConns {
+			s.activeMulticastAddr = addr
+			log.Printf("已切换到多播地址: %s", addr)
+			break
+		}
+	}
+
+	return nil
+}
+
+// GetActiveMulticastAddr 获取当前活跃的多播地址
+func (s *RTPServer) GetActiveMulticastAddr() string {
+	s.multicastMutex.RLock()
+	defer s.multicastMutex.RUnlock()
+	return s.activeMulticastAddr
+}
+
+// ListMulticastAddrs 列出所有已连接的多播地址
+func (s *RTPServer) ListMulticastAddrs() []string {
+	s.multicastMutex.RLock()
+	defer s.multicastMutex.RUnlock()
+
+	addrs := make([]string, 0, len(s.multicastConns))
+	for addr := range s.multicastConns {
+		addrs = append(addrs, addr)
+	}
+	return addrs
+}
+
+// receiveMulticast 接收多播数据并转发给客户端
+func (s *RTPServer) receiveMulticast(multicastAddr string, conn *net.UDPConn) {
+	buffer := make([]byte, packetSize)
+	log.Printf("开始从多播地址 %s 接收数据", multicastAddr)
+
+	for s.isRunning {
+		n, _, err := conn.ReadFromUDP(buffer)
+		if err != nil {
+			// 检查连接是否已关闭
+			s.multicastMutex.RLock()
+			_, stillExists := s.multicastConns[multicastAddr]
+			s.multicastMutex.RUnlock()
+
+			if s.isRunning && stillExists {
+				log.Printf("从多播组 %s 读取数据失败: %v", multicastAddr, err)
+			} else {
+				// 连接已关闭，退出协程
+				log.Printf("多播地址 %s 的接收已停止", multicastAddr)
+				return
+			}
+			continue
+		}
+
+		// 只有从当前活跃的多播地址接收的数据才转发给客户端
+		s.multicastMutex.RLock()
+		isActive := (multicastAddr == s.activeMulticastAddr)
+		s.multicastMutex.RUnlock()
+
+		if isActive {
+			s.forwardPacket(buffer[:n])
+		}
+	}
+}
+
+// forwardPacket 将RTP数据包转发给所有客户端
+func (s *RTPServer) forwardPacket(packet []byte) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+
+	for key, client := range s.clients {
+		_, err := client.conn.Write(packet)
+		if err != nil {
+			log.Printf("转发数据包到客户端 %s 失败: %v", key, err)
+			// 客户端可能已断开，后台执行删除操作
+			go s.UnregisterClient(client.addr)
+		}
+	}
+}
+
+// RegisterClient 注册新的RTP客户端
+func (s *RTPServer) RegisterClient(addr *net.UDPAddr) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	key := addr.String()
+	if _, exists := s.clients[key]; !exists {
+		conn, err := net.DialUDP("udp", nil, addr)
+		if err != nil {
+			log.Printf("无法连接到客户端 %s: %v", key, err)
+			return
+		}
+
+		s.clients[key] = &RTPClient{
+			conn:     conn,
+			addr:     addr,
+			lastSeen: time.Now().Unix(),
+		}
+		log.Printf("新客户端已连接: %s", key)
+		
+		// 检查是否需要启动多播接收
+		s.multicastMutex.Lock()
+		defer s.multicastMutex.Unlock()
+		
+		activeAddr := s.activeMulticastAddr
+		if activeAddr != "" {
+			s.clientsPerMulticast[activeAddr] = s.clientsPerMulticast[activeAddr] + 1
+			
+			// 先检查连接是否存在
+			_, exists := s.multicastConns[activeAddr]
+			// 如果这是第一个客户端且连接不存在，启动多播接收
+			if s.clientsPerMulticast[activeAddr] == 1 && !exists {
+				// 不等待错误处理，避免阻塞注册过程
+				go func(addr string) {
+					if err := s.joinMulticastGroupInternal(addr); err != nil {
+						log.Printf("为客户端启动多播接收失败 %s: %v", addr, err)
+					}
+				}(activeAddr)
+			}
+		}
+	} else {
+		// 更新最后一次活动时间
+		s.clients[key].lastSeen = time.Now().Unix()
+		log.Printf("客户端已重新连接: %s", key)
+	}
+}
+
+// UnregisterClient 注销RTP客户端
+func (s *RTPServer) UnregisterClient(addr *net.UDPAddr) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	key := addr.String()
+	if client, exists := s.clients[key]; exists {
+		client.conn.Close()
+		delete(s.clients, key)
+		log.Printf("客户端断开连接: %s", key)
+		
+		// 更新多播地址的客户端计数
+		s.multicastMutex.Lock()
+		defer s.multicastMutex.Unlock()
+		
+		activeAddr := s.activeMulticastAddr
+		if activeAddr != "" {
+			s.clientsPerMulticast[activeAddr] = s.clientsPerMulticast[activeAddr] - 1
+			
+			// 如果没有客户端了，停止多播接收
+			if s.clientsPerMulticast[activeAddr] <= 0 {
+				s.clientsPerMulticast[activeAddr] = 0
+				
+				// 如果多播连接存在，关闭它
+				if conn, exists := s.multicastConns[activeAddr]; exists {
+					conn.Close()
+					delete(s.multicastConns, activeAddr)
+					log.Printf("无客户端连接，已停止多播地址 %s 的接收", activeAddr)
+				}
+			}
+		}
+	}
+}
+
+// joinMulticastGroupInternal 内部方法，实际执行多播组加入
+// 不包含互斥锁，调用者需负责锁定
+func (s *RTPServer) joinMulticastGroupInternal(multicastAddrStr string) error {
+	// 解析多播地址
+	mcAddr, err := net.ResolveUDPAddr("udp", multicastAddrStr)
+	if err != nil {
+		return fmt.Errorf("无法解析多播地址: %v", err)
+	}
+
+	// 尝试连接到多播组
+	conn, err := net.ListenMulticastUDP("udp4", nil, mcAddr)
+	if err != nil {
+		// 如果第一次尝试失败，使用明确的接口尝试
+		success := false
+		interfaces, errIface := net.Interfaces()
+		if errIface == nil {
+			for _, iface := range interfaces {
+				// 跳过不支持多播、未激活或环回接口
+				if iface.Flags&net.FlagMulticast == 0 ||
+					iface.Flags&net.FlagUp == 0 ||
+					iface.Flags&net.FlagLoopback != 0 {
+					continue
+				}
+
+				conn, err = net.ListenMulticastUDP("udp4", &iface, mcAddr)
+				if err != nil {
+					continue
+				}
+
+				success = true
+				log.Printf("在接口 %s 上成功加入多播组 %s", iface.Name, multicastAddrStr)
+				break
+			}
+		}
+
+		if !success {
+			return fmt.Errorf("无法连接到多播组: %v", err)
+		}
+	}
+
+	// 设置接收缓冲区大小
+	if err := conn.SetReadBuffer(1024 * 1024); err != nil {
+		log.Printf("无法设置接收缓冲区大小: %v", err)
+	}
+
+	// 保存连接
+	s.multicastConns[multicastAddrStr] = conn
+	log.Printf("成功加入多播组 %v", multicastAddrStr)
+
+	// 启动接收协程
+	go s.receiveMulticast(multicastAddrStr, conn)
+
+	return nil
+}
+
+// Stop 停止RTP服务器
+func (s *RTPServer) Stop() {
+	if !s.isRunning {
+		return
+	}
+
+	s.isRunning = false
+	s.listenConn.Close()
+
+	// 关闭所有多播连接
+	s.multicastMutex.Lock()
+	for addr, conn := range s.multicastConns {
+		conn.Close()
+		delete(s.multicastConns, addr)
+	}
+	s.multicastMutex.Unlock()
+	log.Println("已关闭所有多播连接")
+
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	// 关闭所有客户端连接
+	for key, client := range s.clients {
+		client.conn.Close()
+		delete(s.clients, key)
+	}
+
+	log.Println("RTP服务器已停止")
+}
+
+
+
+// 在主函数中使用
+func startRTPServer() {
+	rtpServer, err := NewRTPServer()
+	if err != nil {
+		log.Fatalf("无法创建RTP服务器: %v", err)
+	}
+
+	// 注册HTTP处理函数
+	// registerRTPHandlers(rtpServer)
+
+	// 设置默认多播地址为活跃，但不立即连接
+	rtpServer.multicastMutex.Lock()
+	rtpServer.activeMulticastAddr = multicastAddr
+	rtpServer.multicastMutex.Unlock()
+	log.Printf("已设置默认多播地址: %s (将在有客户端连接时启动接收)", multicastAddr)
+
+	// 启动RTP服务器
+	go rtpServer.Start()
+}
+
+// 获取客户端IP的函数
+func getClientIP(r *http.Request) string {
+	// 先尝试从X-Real-IP和X-Forwarded-For头获取客户端IP
+	// 这些通常由代理或负载均衡器设置
+	ip := r.Header.Get("X-Real-IP")
+	if ip == "" {
+		ip = r.Header.Get("X-Forwarded-For")
+		if ip != "" {
+			// X-Forwarded-For可能包含多个IP，取第一个
+			parts := strings.Split(ip, ",")
+			ip = strings.TrimSpace(parts[0])
+		}
+	}
+
+	// 如果没有从头部获取到，则使用RemoteAddr
+	if ip == "" {
+		ip = r.RemoteAddr
+		// RemoteAddr包含端口号，需要分离
+		host, _, err := net.SplitHostPort(ip)
+		if err == nil {
+			ip = host
+		}
+	}
+
+	return ip
 }
