@@ -17,6 +17,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"bufio"
 )
 
 type VideoItem struct {
@@ -618,8 +619,14 @@ func (h *HDMIPlayer) StartPlay(rtpURL string) error {
 	defer h.mutex.Unlock()
 	
 	if h.isPlaying {
-		return fmt.Errorf("已有视频正在播放")
+		// 确保先停止当前播放
+		h.mutex.Unlock() // 临时释放锁以避免死锁
+		h.StopPlay()
+		h.mutex.Lock() // 重新获取锁
 	}
+	
+	// 确保播放器完全关闭并等待一小段时间
+	time.Sleep(500 * time.Millisecond)
 	
 	// 检查播放器是否存在
 	_, err := exec.LookPath(h.playerBin)
@@ -627,8 +634,20 @@ func (h *HDMIPlayer) StartPlay(rtpURL string) error {
 		return fmt.Errorf("找不到播放器 %s: %v", h.playerBin, err)
 	}
 	
+	// 验证流可访问性
+	if err := checkStreamAvailability(rtpURL); err != nil {
+		log.Printf("警告: 流可能不可用 %s: %v", rtpURL, err)
+		// Continue anyway, but log the warning
+	}
+	
 	// 构建播放命令
 	var args []string
+	var env []string = os.Environ()
+	
+	// 添加DISPLAY环境变量确保输出到正确显示器
+	// env = append(env, "DISPLAY=:0.0")
+	// 禁用VLC的X11视频嵌入
+	// env = append(env, "VLC_PLUGIN_PATH=/dev/null")
 	
 	// 使用不同播放器的对应参数
 	if h.playerBin == "omxplayer" {
@@ -641,19 +660,24 @@ func (h *HDMIPlayer) StartPlay(rtpURL string) error {
 			rtpURL,
 		}
 	} else if strings.HasSuffix(h.playerBin, "vlc") || strings.HasSuffix(h.playerBin, "cvlc") {
-		// VLC命令行参数
+		// 更新VLC参数，使用更稳定的配置
 		args = []string{
-			"--fullscreen",        // 全屏显示
-			"--no-video-title",    // 不显示标题
-			"--aout=alsa",         // 使用ALSA而非PulseAudio进行音频输出
-			"--network-caching=100", // 低缓存值用于降低延迟
-			"--file-caching=100",
-			"--sout-mux-caching=100",
-			"--no-audio-time-stretch", // 禁用时间拉伸
-			"--no-video-deco",      // 无装饰
-			"--quiet",              // 减少错误信息
-			rtpURL,                // 播放URL
-			"vlc://quit",          // 播放完毕后退出
+			rtpURL,                // 先放URL确保被正确解析
+			// "--fullscreen",        // 全屏显示
+			// "--video-on-top",      // 视频置顶
+			// "--no-video-title-show", // 不显示标题
+			// "--no-embedded-video", // 不在终端嵌入视频
+			// "--no-qt-error-dialogs", // 禁止错误对话框
+			// "--vout=xcb_xv",       // 使用XCB视频输出模块
+			// "--aout=alsa",         // 使用ALSA音频输出
+			// "--no-keyboard-events", // 禁用键盘事件 
+			// "--no-mouse-events",   // 禁用鼠标事件
+			// "--network-caching=200", // 低缓存值用于降低延迟但增加稳定性
+			// "--live-caching=200",  // 直播流缓存
+			// "--file-caching=200",  // 文件缓存
+			// "--no-video-deco",     // 无装饰
+			// "--quiet",             // 减少错误信息
+			// "--play-and-exit",     // 播放完退出
 		}
 	} else {
 		// 通用参数，只传入URL
@@ -662,6 +686,7 @@ func (h *HDMIPlayer) StartPlay(rtpURL string) error {
 	
 	// 创建命令
 	cmd := exec.Command(h.playerBin, args...)
+	cmd.Env = env // 设置环境变量
 	
 	// 捕获输出用于调试
 	stdout, err := cmd.StdoutPipe()
@@ -675,6 +700,7 @@ func (h *HDMIPlayer) StartPlay(rtpURL string) error {
 	}
 	
 	// 启动命令
+	log.Printf("启动HDMI播放: %s %v", h.playerBin, args)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("启动播放器失败: %v", err)
 	}
@@ -693,6 +719,9 @@ func (h *HDMIPlayer) StartPlay(rtpURL string) error {
 				log.Printf("播放器输出: %s", string(buf[:n]))
 			}
 			if err != nil {
+				if err != io.EOF {
+					log.Printf("读取播放器输出遇到错误: %v", err)
+				}
 				break
 			}
 		}
@@ -703,9 +732,22 @@ func (h *HDMIPlayer) StartPlay(rtpURL string) error {
 		for {
 			n, err := stderr.Read(buf)
 			if n > 0 {
-				log.Printf("播放器错误: %s", string(buf[:n]))
+				errOutput := string(buf[:n])
+				log.Printf("播放器错误: %s", errOutput)
+				
+				// 检查是否有常见错误指示流问题
+				if strings.Contains(errOutput, "connection failed") || 
+				   strings.Contains(errOutput, "no suitable demux") ||
+				   strings.Contains(errOutput, "cannot connect") {
+					log.Printf("检测到流连接问题，将尝试备用方法")
+					// 尝试自动重启播放，采用备用方法
+					go h.tryFallbackMethod(rtpURL)
+				}
 			}
 			if err != nil {
+				if err != io.EOF {
+					log.Printf("读取播放器错误输出遇到错误: %v", err)
+				}
 				break
 			}
 		}
@@ -723,12 +765,148 @@ func (h *HDMIPlayer) StartPlay(rtpURL string) error {
 		if err != nil && err.Error() != "exit status 0" {
 			h.lastError = fmt.Errorf("播放器退出: %v", err)
 			log.Printf("播放停止，错误: %v", err)
+			
+			// 获取当前时间，如果进程运行时间非常短，可能是流问题
+			if time.Since(time.Now()) < 3*time.Second {
+				log.Printf("播放进程运行时间太短，可能存在流问题")
+				// 可以在这里添加更多恢复逻辑
+			}
 		} else {
 			log.Println("播放正常结束")
 		}
 	}()
 	
+	// 增加5秒后检查播放状态
+	go func() {
+		time.Sleep(5 * time.Second)
+		
+		h.mutex.Lock()
+		defer h.mutex.Unlock()
+		
+		if h.isPlaying && h.cmd != nil {
+			// 检查进程状态
+			if h.cmd.ProcessState == nil || !h.cmd.ProcessState.Exited() {
+				log.Printf("播放进程仍在运行，但验证其是否正常显示视频")
+				// 这里可以添加更多的验证逻辑
+			}
+		}
+	}()
+	
 	log.Printf("开始通过HDMI播放RTP流: %s", rtpURL)
+	return nil
+}
+
+// tryFallbackMethod 尝试使用备用方法播放
+func (h *HDMIPlayer) tryFallbackMethod(rtpURL string) {
+	// 等待一段时间确保当前播放已停止
+	time.Sleep(2 * time.Second)
+	
+	h.mutex.Lock()
+	if h.isPlaying {
+		// 如果仍在播放，不执行备用方法
+		h.mutex.Unlock()
+		return
+	}
+	h.mutex.Unlock()
+	
+	log.Printf("尝试使用备用方法播放: %s", rtpURL)
+	
+	// 使用不同的VLC参数尝试播放
+	fallbackArgs := []string{
+		"--fullscreen", 
+		"--intf", "dummy",  // 使用无界面模式
+		"--no-video-title-show",
+		"--no-embedded-video",
+		"--no-keyboard-events",
+		"--no-mouse-events",
+		rtpURL,
+	}
+	
+	cmd := exec.Command(h.playerBin, fallbackArgs...)
+	// 设置DISPLAY环境变量
+	env := os.Environ()
+	env = append(env, "DISPLAY=:0.0")
+	cmd.Env = env
+	
+	// 启动备用播放
+	log.Printf("启动备用播放方法: %s %v", h.playerBin, fallbackArgs)
+	if err := cmd.Start(); err != nil {
+		log.Printf("备用播放方法失败: %v", err)
+		return
+	}
+	
+	h.mutex.Lock()
+	h.cmd = cmd
+	h.isPlaying = true
+	h.mutex.Unlock()
+	
+	// 监控备用播放进程
+	go func() {
+		err := cmd.Wait()
+		h.mutex.Lock()
+		defer h.mutex.Unlock()
+		
+		h.isPlaying = false
+		h.cmd = nil
+		
+		if err != nil {
+			log.Printf("备用播放方法停止，错误: %v", err)
+		} else {
+			log.Println("备用播放方法正常结束")
+		}
+	}()
+}
+
+// 检查RTP流是否可用
+func checkStreamAvailability(rtpURL string) error {
+	// 从URL中提取地址和端口
+	urlParts := strings.Split(rtpURL, "://")
+	if len(urlParts) != 2 {
+		return fmt.Errorf("无效的URL格式")
+	}
+	
+	addrParts := strings.Split(urlParts[1], ":")
+	if len(addrParts) != 2 {
+		return fmt.Errorf("无效的地址格式")
+	}
+	
+	// 尝试解析UDP地址
+	addr, err := net.ResolveUDPAddr("udp", urlParts[1])
+	if err != nil {
+		return fmt.Errorf("解析地址失败: %v", err)
+	}
+	
+	// 检查多播地址可达性
+	// 注意：这只是一个基本检查，不能保证流内容可播放
+	if addr.IP.IsMulticast() {
+		ifaces, err := net.Interfaces()
+		if err != nil {
+			return fmt.Errorf("获取网络接口失败: %v", err)
+		}
+		
+		foundMulticastIface := false
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagMulticast != 0 && iface.Flags&net.FlagUp != 0 {
+				foundMulticastIface = true
+				break
+			}
+		}
+		
+		if !foundMulticastIface {
+			return fmt.Errorf("没有可用的多播网络接口")
+		}
+		
+		log.Printf("多播地址 %s 初步检查通过", addr.String())
+		return nil
+	}
+	
+	// 对于非多播地址进行简单连接测试
+	conn, err := net.DialTimeout("udp", addr.String(), 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("连接测试失败: %v", err)
+	}
+	defer conn.Close()
+	
 	return nil
 }
 
@@ -741,57 +919,67 @@ func (h *HDMIPlayer) StopPlay() error {
 		return nil // 已经停止了
 	}
 	
-	// 向进程发送退出命令
-	if h.playerBin == "omxplayer" {
-		// omxplayer 特定的停止逻辑
-		if err := h.cmd.Process.Signal(syscall.SIGINT); err != nil {
-			log.Printf("发送SIGINT失败: %v，尝试强制终止", err)
-		} else {
-			// 给一点时间优雅退出
-			time.Sleep(500 * time.Millisecond)
-		}
-	} else if strings.HasSuffix(h.playerBin, "vlc") || strings.HasSuffix(h.playerBin, "cvlc") {
-		// VLC 可以用 SIGTERM 或 SIGINT 信号终止
+	log.Printf("停止HDMI播放: %s", h.playingURL)
+	
+	// 更彻底地关闭进程
+	// 先尝试正常关闭
+	if strings.HasSuffix(h.playerBin, "vlc") || strings.HasSuffix(h.playerBin, "cvlc") {
+		// VLC可以通过SIGTERM信号正常退出
 		if err := h.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 			log.Printf("发送SIGTERM到VLC失败: %v，尝试强制终止", err)
 		} else {
 			// 给VLC一点时间优雅退出
-			time.Sleep(1000 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
+		}
+	} else if h.playerBin == "omxplayer" {
+		// omxplayer特定的停止逻辑
+		if err := h.cmd.Process.Signal(syscall.SIGINT); err != nil {
+			log.Printf("发送SIGINT失败: %v，尝试强制终止", err)
+		} else {
+			time.Sleep(500 * time.Millisecond)
 		}
 	}
 	
-	// 如果进程仍在运行，发送终止信号
+	// 如果进程仍在运行，更强硬地终止
 	if h.cmd.ProcessState == nil || !h.cmd.ProcessState.Exited() {
-		if err := h.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-			// 如果失败，强制终止
-			if killErr := h.cmd.Process.Kill(); killErr != nil {
-				return fmt.Errorf("无法终止播放进程: %v", killErr)
-			}
+		// 先尝试SIGKILL
+		if err := h.cmd.Process.Kill(); err != nil {
+			log.Printf("无法终止播放进程: %v", err)
+			// 即使出错也继续尝试清理
+		}
+		
+		// 等待超时机制确保进程结束
+		done := make(chan error, 1)
+		go func() {
+			done <- h.cmd.Wait()
+		}()
+		
+		select {
+		case <-done:
+			// 进程已经退出
+			log.Println("播放进程已终止")
+		case <-time.After(2 * time.Second):
+			log.Println("进程终止超时，强制清理")
 		}
 	}
 	
-	// 等待进程完全退出的超时机制
-	done := make(chan error, 1)
-	go func() {
-		done <- h.cmd.Wait()
-	}()
-	
-	select {
-	case <-done:
-		// 进程已经退出
-	case <-time.After(3 * time.Second):
-		// 超时，强制终止
-		if h.cmd.Process != nil {
-			if err := h.cmd.Process.Kill(); err != nil {
-				return fmt.Errorf("强制终止播放器超时: %v", err)
-			}
-		}
-	}
-	
+	// 完全清理进程状态
 	h.isPlaying = false
 	h.cmd = nil
 	h.playingURL = ""
-	log.Println("HDMI播放已停止")
+	
+	// 确保VLC不会在控制台留下任何残留的显示
+	if strings.HasSuffix(h.playerBin, "vlc") || strings.HasSuffix(h.playerBin, "cvlc") {
+		// 清理可能的遗留进程
+		exec.Command("pkill", "-9", "vlc").Run()
+		exec.Command("pkill", "-9", "cvlc").Run()
+		
+		// 在某些情况下，可能需要重置终端
+		// 这通常在桌面环境不需要，但在纯控制台环境可能有用
+		exec.Command("reset").Run()
+	}
+	
+	log.Println("HDMI播放已完全停止")
 	return nil
 }
 
@@ -1152,10 +1340,147 @@ func TranscodeMKVToMP4(inputPath, outputPath string) error {
 	return nil
 }
 
+var channelsList []Channel
+var currentChannelIndex int = 0
+var channelMutex sync.Mutex
+
+// IRRemoteListener starts a goroutine that listens for IR remote signals
+// and handles channel switching when UP/DOWN keys are detected
+func startIRRemoteListener(hdmiPlayer *HDMIPlayer) {
+	log.Println("Starting IR remote control listener")
+	
+	// Make sure we have channels loaded
+	if len(channelsList) == 0 {
+		var err error
+		channelsList, err = loadChannels("/home/pi/projects/my_stream_server/channels.json")
+		if err != nil {
+			log.Printf("Error loading channels for IR control: %v", err)
+			return
+		}
+		log.Printf("Loaded %d channels for IR remote control", len(channelsList))
+	}
+	
+	go func() {
+		cmd := exec.Command("irw")
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			log.Printf("Error creating irw pipe: %v", err)
+			return
+		}
+		
+		if err := cmd.Start(); err != nil {
+			log.Printf("Error starting irw: %v", err)
+			return
+		}
+		
+		// Create a scanner to read irw output
+		scanner := bufio.NewScanner(stdout)
+		
+		log.Println("IR remote listener started, waiting for key presses")
+		
+		for scanner.Scan() {
+			line := scanner.Text()
+			log.Printf("IR received: %s", line)
+			
+			// Check for UP/DOWN keys
+			if strings.Contains(line, "KEY_UP") {
+				log.Println("UP key detected, switching to next channel")
+				stepChannel(hdmiPlayer, "up")
+			} else if strings.Contains(line, "KEY_DOWN") {
+				log.Println("DOWN key detected, switching to previous channel")
+				stepChannel(hdmiPlayer, "down")
+			}
+		}
+		
+		if err := scanner.Err(); err != nil {
+			log.Printf("Error reading from irw: %v", err)
+		}
+		
+		log.Println("IR remote listener stopped")
+		
+		// If irw exits, wait for the process to complete
+		if err := cmd.Wait(); err != nil {
+			log.Printf("irw exited with error: %v", err)
+		}
+	}()
+}
+
+// stepChannel changes the TV channel in the specified direction
+func stepChannel(hdmiPlayer *HDMIPlayer, direction string) {
+	channelMutex.Lock()
+	defer channelMutex.Unlock()
+	
+	if len(channelsList) == 0 {
+		log.Println("No channels available for switching")
+		return
+	}
+	
+	// 记录之前的频道索引，以便失败时恢复
+	previousIndex := currentChannelIndex
+	
+	// 先完全停止当前播放，确保前一个进程结束
+	if err := hdmiPlayer.StopPlay(); err != nil {
+		log.Printf("Error stopping current playback: %v", err)
+		// 尝试强制清理VLC进程
+		exec.Command("pkill", "-9", "vlc").Run()
+		exec.Command("pkill", "-9", "cvlc").Run()
+		// 给系统一点时间清理
+		time.Sleep(1 * time.Second)
+	}
+	
+	// Update the channel index based on direction
+	if direction == "up" {
+		currentChannelIndex = (currentChannelIndex + 1) % len(channelsList)
+	} else if direction == "down" {
+		currentChannelIndex = (currentChannelIndex - 1 + len(channelsList)) % len(channelsList)
+	}
+	
+	// Get the selected channel
+	channel := channelsList[currentChannelIndex]
+	log.Printf("Switching to channel: %s (%s)", channel.ChannelName, channel.ChannelURL)
+	
+	// Add rtp:// prefix if not present
+	rtpURL := channel.ChannelURL
+	if !strings.HasPrefix(rtpURL, "rtp://") {
+		rtpURL = "rtp://" + rtpURL
+	}
+	
+	// 确保完全停止后再开始新播放
+	time.Sleep(1 * time.Second)
+	
+	// Start playing the channel
+	if err := hdmiPlayer.StartPlay(rtpURL); err != nil {
+		log.Printf("Error playing channel: %v", err)
+		log.Printf("Trying to continue with next channel")
+		
+		// 如果播放失败，尝试下一个频道
+		if direction == "up" {
+			currentChannelIndex = (currentChannelIndex + 1) % len(channelsList)
+		} else if direction == "down" {
+			currentChannelIndex = (currentChannelIndex - 1 + len(channelsList)) % len(channelsList)
+		}
+		
+		// 第二次尝试
+		nextChannel := channelsList[currentChannelIndex]
+		log.Printf("Trying next channel: %s (%s)", nextChannel.ChannelName, nextChannel.ChannelURL)
+		
+		rtpURL = nextChannel.ChannelURL
+		if !strings.HasPrefix(rtpURL, "rtp://") {
+			rtpURL = "rtp://" + rtpURL
+		}
+		
+		if err := hdmiPlayer.StartPlay(rtpURL); err != nil {
+			log.Printf("Second attempt also failed: %v", err)
+			// 恢复到之前的频道索引
+			currentChannelIndex = previousIndex
+		}
+	}
+}
+
 func main() {
 	// 添加命令行参数
 	httpPort := flag.Int("port", 8088, "HTTP服务器端口")
-	videoDir := flag.String("videos", "/mnt/nvme/videos", "视频文件目录")
+	videoDir := flag.String("videos", "./videos", "视频文件目录")
 	
 	// 添加HLS相关参数
 	hlsDir := flag.String("hls-dir", "./hls", "HLS输出目录")
@@ -1198,8 +1523,20 @@ func main() {
 	RegisterHLSHandlers(hlsManager)
 	addHLSPlayer(hlsManager)
 
-	// 创建HDMI播放器
+	// Load channel list at startup
+	var err error
+	channelsList, err = loadChannels("/home/pi/projects/my_stream_server/channels.json")
+	if err != nil {
+		log.Printf("Error loading channels: %v", err)
+	} else {
+		log.Printf("Loaded %d channels", len(channelsList))
+	}
+
+	// Create HDMI player
 	hdmiPlayer := NewHDMIPlayer(*hdmiPlayerBin)
+	
+	// Start IR remote listener
+	startIRRemoteListener(hdmiPlayer)
 	
 	// 启动RTP服务器
 	rtpServer, err := NewRTPServer()
@@ -1225,7 +1562,7 @@ func main() {
 		json.NewEncoder(w).Encode(videos)
 	})
 
-	// 处理视频文件请求
+// 处理视频文件请求
 	http.HandleFunc("/video/", func(w http.ResponseWriter, r *http.Request) {
 		// CORS 头
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1241,45 +1578,12 @@ func main() {
 		filePath := filepath.Join(*videoDir, relativePath)
 
 		// 安全检查：确保文件路径在videoDir目录下
-		if (!strings.HasPrefix(filepath.Clean(filePath), filepath.Clean(*videoDir))) {
+		if !strings.HasPrefix(filepath.Clean(filePath), filepath.Clean(*videoDir)) {
 			http.Error(w, "Forbidden", http.StatusForbidden)
 			return
 		}
 
 		ext := strings.ToLower(filepath.Ext(relativePath))
-		
-		// Check if iOS client is requesting MKV file
-		userAgent := r.Header.Get("User-Agent")
-		isIOS := strings.Contains(userAgent, "iPhone") || strings.Contains(userAgent, "iPad") || strings.Contains(userAgent, "iPod")
-		
-		if ext == ".mkv" && isIOS {
-			// Create a temporary MP4 file for iOS clients
-			tempDir := filepath.Join(*videoDir, "temp_ios")
-			os.MkdirAll(tempDir, 0755)
-			
-			// Generate output path with same name but mp4 extension
-			baseName := filepath.Base(relativePath)
-			nameWithoutExt := strings.TrimSuffix(baseName, ext)
-			mp4Path := filepath.Join(tempDir, nameWithoutExt + ".mp4")
-			
-			// Check if converted file already exists
-			if _, err := os.Stat(mp4Path); os.IsNotExist(err) {
-				// File doesn't exist, perform conversion
-				log.Printf("Converting MKV to MP4 for iOS client: %s", relativePath)
-				if err := TranscodeMKVToMP4(filePath, mp4Path); err != nil {
-					log.Printf("Conversion failed: %v", err)
-					http.Error(w, "Conversion failed", http.StatusInternalServerError)
-					return
-				}
-			}
-			
-			// Serve the MP4 file instead
-			w.Header().Set("Content-Type", "video/mp4")
-			http.ServeFile(w, r, mp4Path)
-			return
-		}
-		
-		// Continue with normal serving for other cases
 		if ext == ".mkv" {
 			w.Header().Set("Content-Type", "video/mkv")
 		} else {
